@@ -1,0 +1,10 @@
+master: Starting Map/Reduce task test
+Merge: read mrtmp.test-res-0
+master: Map/Reduce task completed
+master: Starting Map/Reduce task test
+Merge: read mrtmp.test-res-0
+Merge: read mrtmp.test-res-1
+Merge: read mrtmp.test-res-2
+master: Map/Reduce task completed
+PASS
+ok  	_/Users/aimin.zhang/6.824/src/mapreduce	3.888s
