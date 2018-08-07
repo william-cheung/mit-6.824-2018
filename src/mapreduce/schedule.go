@@ -29,38 +29,59 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 
 	// All ntasks tasks have to be scheduled on workers. Once all tasks
 	// have completed successfully, schedule() should return.
-	//
-	// Your code here (Part III, Part IV).
-	//
 
-	done := make([] chan int, ntasks)
-	for i := 0; i < ntasks; i++ {
-		done[i] = make(chan int)
+	idleChan := make(chan string)
+	taskChan := make(chan int)
+	doneChan := make(chan int)
+
+	getIdleWorker := func() string {
+		var worker string
+		select {
+		case worker = <-registerChan:
+		case worker = <-idleChan:
+		}
+		return worker
 	}
 
-	for i := 0; i < ntasks; i++ {
-		worker := <- registerChan
-		taskNumber := i
+	doTask := func(worker string, task int) {
+		var args DoTaskArgs
+		args.JobName = jobName
+		args.File = mapFiles[task]
+		args.Phase = phase
+		args.TaskNumber = task
+		args.NumOtherPhase = n_other
 
-		go func() {
-			var args DoTaskArgs
-			args.JobName = jobName
-			args.File = mapFiles[taskNumber]
-			args.Phase = phase
-			args.TaskNumber = taskNumber
-			args.NumOtherPhase = n_other
-
-			call(worker, "Worker.DoTask", args, nil)
-
-			registerChan <- worker
-			done[taskNumber] <- 1
-		}()
+		ok := call(worker, "Worker.DoTask", args, nil)
+		if ok {
+			doneChan <- 1
+			idleChan <- worker
+		} else {
+			fmt.Printf("schedule: RPC %s Worker.DoTask error\n", worker)
+			taskChan <- task
+		}
 	}
 
-	for i := 0; i < ntasks; i++ {
-		<- done[i]
-		fmt.Printf("Done %d\n", i)
+	go func() {
+		for t := range taskChan {
+			worker := getIdleWorker()
+			task := t
+			go func() {
+				doTask(worker, task)
+			}()
+		}
+	}()
+
+	go func() {
+		for t := 0; t < ntasks; t++ {
+			taskChan <- t
+		}
+	}()
+
+	for t := 0; t < ntasks; t++ {
+		<-doneChan
 	}
+
+	close(taskChan)
 
 	fmt.Printf("Schedule: %v done\n", phase)
 }
