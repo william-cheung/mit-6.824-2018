@@ -67,7 +67,7 @@ type Raft struct {
 	state       int // This peer's current state or role
 	heartbeatCh chan int
 
-	log []LogEntry // Log entries. Start at index 1
+	log []LogEntry // Log entries. Start from index 1
 
 	commitIndex int // Index of highest log entry known to be committed
 	lastApplied int // Index of highest log entry applied to state machine
@@ -182,6 +182,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	select {
+	case rf.heartbeatCh <- 1:
+	default:
+	}
+
 	if args.Term > rf.currentTerm || rf.state == Candidate {
 		rf.transitionTo(args.Term, Follower)
 	}
@@ -210,12 +215,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.commitIndex = newCommit
 	}
 
+	DPrintf("log of %d: %v, commitIndex %d", rf.me, rf.log, rf.commitIndex)
 	reply.Term, reply.Success = rf.currentTerm, true
 
-	select {
-	case rf.heartbeatCh <- 1:
-	default:
-	}
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -338,6 +340,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	rf.mu.Unlock()
 
+	DPrintf("Start command %v @ %d -> %d, %d, %v",
+		command, rf.me, index, term, isLeader)
+
 	return index, term, isLeader
 }
 
@@ -387,9 +392,13 @@ func (rf *Raft) runAsFollower() {
 
 func (rf *Raft) collectVotes() <-chan bool {
 	rf.mu.Lock()
+	lastLogIndex := len(rf.log) - 1
+	lastLogTerm := rf.log[lastLogIndex].Term
 	args := RequestVoteArgs{
 		Term:        rf.currentTerm,
 		CandidateId: rf.me,
+		LastLogIndex: lastLogIndex,
+		LastLogTerm: lastLogTerm,
 	}
 	rf.mu.Unlock()
 
@@ -466,23 +475,134 @@ func (rf *Raft) runForLeader() {
 	rf.mu.Unlock()
 }
 
+func (rf *Raft) reinitLeaderState() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	for peer, _ := range rf.peers {
+		rf.nextIndex[peer] = len(rf.log)
+		rf.matchIndex[peer] = 0
+	}
+}
+
+func (rf *Raft) syncLogWithFollower(server int) {
+	for {
+		rf.mu.Lock()
+		if rf.isKilled || rf.state != Leader {
+			rf.mu.Unlock()
+			return
+		}
+
+		term := rf.currentTerm
+
+		lastLogIndex := len(rf.log) - 1
+		nextIndex := rf.nextIndex[server]
+		if lastLogIndex < nextIndex {
+			rf.mu.Unlock()
+			time.Sleep(5 * time.Millisecond)
+			continue
+		}
+
+		prevLogIndex := nextIndex - 1
+		prevLogTerm := rf.log[prevLogIndex].Term
+		nEntries := lastLogIndex - prevLogIndex
+		if nEntries > 10 {
+			nEntries = 10
+		}
+		entries := rf.log[nextIndex : nextIndex+nEntries]
+		commitIndex := rf.commitIndex
+		rf.mu.Unlock()
+
+		args := AppendEntriesArgs{
+			Term:         term,
+			LeaderId:     rf.me,
+			PrevLogTerm:  prevLogTerm,
+			PrevLogIndex: prevLogIndex,
+			Entries:      entries,
+			LeaderCommit: commitIndex,
+		}
+		var reply AppendEntriesReply
+		if rf.sendAppendEntries(server, &args, &reply) {
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			if reply.Success {
+				rf.nextIndex[server] += nEntries
+				rf.matchIndex[server] = prevLogIndex + nEntries
+			} else {
+				if reply.Term > rf.currentTerm {
+					rf.transitionTo(reply.Term, Follower)
+				} else {
+					rf.nextIndex[server] -= 1
+				}
+			}
+		}
+	}
+
+}
+
+func (rf *Raft) updateCommitIndex() {
+	for {
+		rf.mu.Lock()
+		if rf.isKilled || rf.state != Leader {
+			rf.mu.Unlock()
+			return
+		}
+
+		commitIndex := rf.commitIndex
+		for peer, _ := range rf.peers {
+			n := rf.matchIndex[peer]
+			count := 0
+			if n <= commitIndex {
+				continue
+			}
+			for peer, _ := range rf.peers {
+				if n <= rf.matchIndex[peer] {
+					count += 1
+				}
+			}
+			if count > len(rf.peers)/2 {
+				commitIndex = n
+			}
+		}
+		committed := commitIndex - rf.commitIndex
+		if committed == 0 {
+			rf.mu.Unlock()
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		rf.commitIndex = commitIndex
+		rf.mu.Unlock()
+	}
+}
+
 func (rf *Raft) runAsLeader() {
+	rf.reinitLeaderState()
+
+	for peer, _ := range rf.peers {
+		go rf.syncLogWithFollower(peer)
+	}
+
+	go rf.updateCommitIndex()
+
 	heartbeatInterval := 100 * time.Millisecond
 	for {
 		timeoutCh := time.After(heartbeatInterval)
 
 		rf.mu.Lock()
-		term, state, isKilled := rf.currentTerm, rf.state, rf.isKilled
-		rf.mu.Unlock()
-
-		if isKilled || state != Leader {
+		if rf.isKilled || rf.state != Leader {
+			rf.mu.Unlock()
 			return
 		}
 
+		term := rf.currentTerm
+		commitIndex := rf.commitIndex
+		rf.mu.Unlock()
+
 		args := AppendEntriesArgs{
-			Term:     term,
-			LeaderId: rf.me,
+			Term:         term,
+			LeaderId:     rf.me,
+			LeaderCommit: commitIndex,
 		}
+
 		failCh := make(chan bool, len(rf.peers))
 		for peer, _ := range rf.peers {
 			go func(peer int) {
@@ -503,9 +623,12 @@ func (rf *Raft) runAsLeader() {
 				rf.mu.Lock()
 				if reply.Term > rf.currentTerm {
 					rf.transitionTo(reply.Term, Follower)
+					failCh <- true
+				} else {
+					rf.nextIndex[peer] -= 1
+					failCh <- false
 				}
 				rf.mu.Unlock()
-				failCh <- true
 			}(peer)
 		}
 
@@ -584,8 +707,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
-	rf.nextIndex = nil
-	rf.matchIndex = nil
+	rf.nextIndex = make([]int, len(peers))
+	rf.matchIndex = make([]int, len(peers))
 
 	rf.isKilled = false
 
