@@ -396,11 +396,20 @@ func (rf *Raft) runAsFollower() {
 		}
 
 		t := time.NewTimer(electionTimeout)
+
+		// rf.heartbeatCh has priority over t.C
+		// a workaround using nested selects
 		select {
 		case <-rf.heartbeatCh:
 			t.Stop()
 			continue
-		case <-t.C:
+		default:
+			select {
+			case <-rf.heartbeatCh:
+				t.Stop()
+				continue
+			case <-t.C:
+			}
 		}
 		break
 	}
@@ -547,35 +556,36 @@ func (rf *Raft) appendEntries(server int, count int) bool {
 	return stateChanged
 }
 
-func (rf *Raft) syncLogWithFollowers() {
-	for {
-		syncVec := make([]bool, len(rf.peers))
 
+func (rf *Raft) syncLogWithFollower(server int) {
+	for {
 		rf.mu.Lock()
 		if rf.isKilled || rf.state != Leader {
 			rf.mu.Unlock()
 			return
 		}
 		lastLogIndex := len(rf.log) - 1
-		for peer, _ := range rf.peers {
-			nextIndex := rf.nextIndex[peer]
-			if lastLogIndex >= nextIndex {
-				syncVec[peer] = true
-			}
+		nextIndex := rf.nextIndex[server]
+		if lastLogIndex < nextIndex {
+			time.Sleep(10 * time.Millisecond)
+			rf.mu.Unlock()
+			continue
 		}
 		rf.mu.Unlock()
 
-		for peer, ok := range syncVec {
-			if ok {
-				stateChanged := rf.appendEntries(peer, 10)
-				if stateChanged {
-					return
-				}
-			}
+		if rf.appendEntries(server, 10) {
+			return
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+func (rf *Raft) syncLogWithFollowers() {
+	for peer, _ := range rf.peers {
+		go rf.syncLogWithFollower(peer)
+	}
+}
+
 
 func (rf *Raft) updateCommitIndex() {
 	for {
@@ -584,7 +594,7 @@ func (rf *Raft) updateCommitIndex() {
 			rf.mu.Unlock()
 			return
 		}
-		//DPrintf("matchIndex of %d: %v", rf.me, rf.matchIndex)
+		DPrintf("matchIndex of %d: %v", rf.me, rf.matchIndex)
 		commitIndex := rf.commitIndex
 		for peer, _ := range rf.peers {
 			n := rf.matchIndex[peer]
