@@ -179,6 +179,11 @@ type AppendEntriesReply struct {
 	// true if follwer contained entry matching
 	// PrevLogIndex and PrevLogTerm
 	Success bool
+
+	// Fields for fast back up of nextIndex of a follower
+	XTerm  int // term in the conflicting log entry (if any)
+	XIndex int // index of first log entry with XTerm (if any)
+	XLen   int // log length of the follower
 }
 
 //
@@ -204,8 +209,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.transitionTo(args.Term, Follower)
 	}
 
-	if args.PrevLogIndex >= len(rf.log) ||
-		rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	if args.PrevLogIndex >= len(rf.log) {
+		reply.XLen = len(rf.log) - 1
+		reply.Term, reply.Success = rf.currentTerm, false
+		return
+	}
+
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.XLen = len(rf.log) - 1
+		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		for index := args.PrevLogIndex - 1; index > 0; index-- {
+			if rf.log[index].Term == reply.XTerm {
+				reply.XIndex = index
+			}
+		}
 		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	}
@@ -536,7 +553,7 @@ func (rf *Raft) appendEntries(server int, count int) bool {
 	}
 
 	var reply AppendEntriesReply
-	var stateChanged bool
+
 	if rf.sendAppendEntries(server, &args, &reply) {
 		rf.mu.Lock()
 		defer rf.mu.Unlock()
@@ -546,16 +563,27 @@ func (rf *Raft) appendEntries(server int, count int) bool {
 		} else {
 			if reply.Term > rf.currentTerm {
 				rf.transitionTo(reply.Term, Follower)
-				stateChanged = true
-			} else {
-				rf.nextIndex[server] -= 1
+				return true // state changed
 			}
 
+			if reply.XLen < prevLogIndex {
+				rf.nextIndex[server] = reply.XLen + 1
+				return false
+			}
+			for i := prevLogIndex - 1; i >= 0; i-- {
+				term := rf.log[i].Term
+				if term == reply.XTerm {
+					rf.nextIndex[server] = i + 1
+					return false
+				} else if term < reply.XTerm {
+					break
+				}
+			}
+			rf.nextIndex[server] = reply.XIndex
 		}
 	}
-	return stateChanged
+	return false
 }
-
 
 func (rf *Raft) syncLogWithFollower(server int) {
 	for {
@@ -585,7 +613,6 @@ func (rf *Raft) syncLogWithFollowers() {
 		go rf.syncLogWithFollower(peer)
 	}
 }
-
 
 func (rf *Raft) updateCommitIndex() {
 	for {
