@@ -116,7 +116,7 @@ func (rf *Raft) transitionTo(term int, state int) {
 	switch (state) {
 	case Follower:
 		rf.votedFor = -1
-		atomic.CompareAndSwapInt32(&rf.heartbeat, 0, 1)
+		rf.onHeartbeatReceived(-1) // to reset timer
 	case Candidate:
 		atomic.CompareAndSwapInt32(&rf.heartbeat, 1, 0)
 	case Leader:
@@ -424,12 +424,12 @@ func (rf *Raft) getElectionTimeout() time.Duration {
 }
 
 func (rf *Raft) runAsFollower() {
-	electionTimeout := rf.getElectionTimeout()
 	for {
 		if rf.IsKilled() {
 			return
 		}
 
+		electionTimeout := rf.getElectionTimeout()
 		t := time.NewTimer(electionTimeout)
 
 		// rf.heartbeatCh has priority over t.C
@@ -599,8 +599,11 @@ func (rf *Raft) doSyncLogWithFollower(server int, count int) bool {
 	defer rf.mu.Unlock()
 
 	if reply.Success {
-		rf.nextIndex[server] = prevLogIndex + 1 + nEntries
-		rf.matchIndex[server] = prevLogIndex + nEntries
+		nextIndex := prevLogIndex + 1 + nEntries
+		if nextIndex > rf.nextIndex[server] {
+			rf.nextIndex[server] = nextIndex
+			rf.matchIndex[server] = nextIndex - 1
+		}
 	} else {
 		if reply.Term > rf.currentTerm {
 			rf.transitionTo(reply.Term, Follower)
