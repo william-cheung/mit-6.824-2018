@@ -21,6 +21,7 @@ import "sync"
 import "labrpc"
 import "time"
 import "math/rand"
+import "sync/atomic"
 
 // import "bytes"
 // import "labgob"
@@ -65,7 +66,9 @@ type Raft struct {
 	currentTerm int      // Latest term this peer has seen
 	votedFor    int      // CandidateId that received vote in current term
 	state       int      // This peer's current state or role
+
 	heartbeatCh chan int // Channel for heartbeat notification
+	heartbeat   int32    // Indicates a heartbeat is received but not checked
 
 	log []LogEntry // Log entries. Start from index 1
 
@@ -126,6 +129,7 @@ func (rf *Raft) onHeartbeatReceived(leaderId int) {
 	case rf.heartbeatCh <- 1:
 	default:
 	}
+	atomic.CompareAndSwapInt32(&rf.heartbeat, 0, 1)
 }
 
 //
@@ -421,17 +425,17 @@ func (rf *Raft) runAsFollower() {
 		t := time.NewTimer(electionTimeout)
 
 		// rf.heartbeatCh has priority over t.C
-		// a workaround using nested selects
+		// here is a workaround
 		select {
 		case <-rf.heartbeatCh:
+			atomic.CompareAndSwapInt32(
+				&rf.heartbeat, 1, 0)
 			t.Stop()
 			continue
-		default:
-			select {
-			case <-rf.heartbeatCh:
-				t.Stop()
+		case <-t.C:
+			if atomic.CompareAndSwapInt32(
+				&rf.heartbeat, 1, 0) {
 				continue
-			case <-t.C:
 			}
 		}
 		break
@@ -524,9 +528,15 @@ loop:
 				break loop
 			}
 		case <-rf.heartbeatCh:
+			atomic.CompareAndSwapInt32(
+				&rf.heartbeat, 1, 0)
 			state = Follower
 			break loop
 		case <-timeoutCh:
+			if atomic.CompareAndSwapInt32(
+				&rf.heartbeat, 1, 0) {
+				state = Follower
+			}
 			break loop
 		}
 	}
