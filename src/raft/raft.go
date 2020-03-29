@@ -84,6 +84,9 @@ type Raft struct {
 	// on server
 	matchIndex []int
 
+	logSubmitted *sync.Cond // To notify a new log entry has been submitted
+	logCommitted *sync.Cond // To notify a new log entry has been committed
+
 	isKilled bool // Whether this peer has been killed
 }
 
@@ -116,9 +119,7 @@ func (rf *Raft) transitionTo(term int, state int) {
 	switch (state) {
 	case Follower:
 		rf.votedFor = -1
-		rf.onHeartbeatReceived(-1) // to reset timer
-	case Candidate:
-		atomic.CompareAndSwapInt32(&rf.heartbeat, 1, 0)
+		rf.onHeartbeatReceived(-1) // reset timer
 	case Leader:
 		for peer, _ := range rf.peers {
 			rf.nextIndex[peer] = len(rf.log)
@@ -133,11 +134,13 @@ func (rf *Raft) transitionTo(term int, state int) {
 
 func (rf *Raft) onHeartbeatReceived(leaderId int) {
 	DPrintf("heartbeat received: %d --> %d", leaderId, rf.me)
+
+	atomic.CompareAndSwapInt32(&rf.heartbeat, 0, 1)
+
 	select {
 	case rf.heartbeatCh <- 1:
 	default:
 	}
-	atomic.CompareAndSwapInt32(&rf.heartbeat, 0, 1)
 }
 
 //
@@ -264,6 +267,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DPrintf("commitIndex of %d changed: %d -> %d",
 			rf.me, rf.commitIndex, newCommit)
 		rf.commitIndex = newCommit
+		rf.logCommitted.Broadcast()
 	}
 
 	reply.Term, reply.Success = rf.currentTerm, true
@@ -390,6 +394,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		})
 		rf.nextIndex[rf.me] = len(rf.log)
 		rf.matchIndex[rf.me] = len(rf.log) - 1
+		rf.logSubmitted.Broadcast()
 	}
 	rf.mu.Unlock()
 
@@ -409,6 +414,10 @@ func (rf *Raft) Kill() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf("Kill peer %d", rf.me)
+
+	rf.logSubmitted.Broadcast()
+	rf.logCommitted.Broadcast()
+
 	rf.isKilled = true
 }
 
@@ -633,16 +642,16 @@ func (rf *Raft) doSyncLogWithFollower(server int, count int) bool {
 func (rf *Raft) syncLogWithFollower(server int) {
 	for {
 		rf.mu.Lock()
-		if rf.isKilled || rf.state != Leader {
-			rf.mu.Unlock()
-			return
-		}
-		lastLogIndex := len(rf.log) - 1
-		nextIndex := rf.nextIndex[server]
-		if lastLogIndex < nextIndex {
-			time.Sleep(10 * time.Millisecond)
-			rf.mu.Unlock()
-			continue
+		for {
+			if rf.isKilled || rf.state != Leader {
+				rf.mu.Unlock()
+				return
+			}
+			if rf.nextIndex[server] >= len(rf.log) {
+				rf.logSubmitted.Wait()
+			} else {
+				break
+			}
 		}
 		rf.mu.Unlock()
 
@@ -655,7 +664,9 @@ func (rf *Raft) syncLogWithFollower(server int) {
 
 func (rf *Raft) syncLogWithFollowers() {
 	for peer, _ := range rf.peers {
-		go rf.syncLogWithFollower(peer)
+		if peer != rf.me {
+			go rf.syncLogWithFollower(peer)
+		}
 	}
 }
 
@@ -692,6 +703,7 @@ func (rf *Raft) updateCommitIndex() {
 		DPrintf("commitIndex of %d changed: %d -> %d",
 			rf.me, rf.commitIndex, commitIndex)
 		rf.commitIndex = commitIndex
+		rf.logCommitted.Broadcast()
 		rf.mu.Unlock()
 	}
 }
@@ -749,15 +761,18 @@ func (rf *Raft) runAsLeader() {
 func (rf *Raft) applyLog() {
 	for {
 		rf.mu.Lock()
-		if rf.isKilled {
-			rf.mu.Unlock()
-			return
-		}
 
-		if rf.lastApplied == rf.commitIndex {
-			rf.mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
-			continue
+		for {
+			if rf.isKilled {
+				rf.mu.Unlock()
+				return
+			}
+
+			if rf.lastApplied == rf.commitIndex {
+				rf.logCommitted.Wait()
+			} else {
+				break
+			}
 		}
 
 		msgs := make([]ApplyMsg, rf.commitIndex-rf.lastApplied)
@@ -769,6 +784,7 @@ func (rf *Raft) applyLog() {
 				CommandIndex: i,
 			}
 		}
+		rf.lastApplied = rf.commitIndex
 		rf.mu.Unlock()
 
 		for _, msg := range msgs {
@@ -837,6 +853,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	rf.nextIndex = make([]int, len(peers))
 	rf.matchIndex = make([]int, len(peers))
+
+	rf.logSubmitted = sync.NewCond(&rf.mu)
+	rf.logCommitted = sync.NewCond(&rf.mu)
 
 	rf.isKilled = false
 
