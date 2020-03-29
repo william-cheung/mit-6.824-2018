@@ -113,12 +113,20 @@ func (rf *Raft) transitionTo(term int, state int) {
 	rf.currentTerm = term
 	rf.state = state
 
-	if state == Follower {
+	switch (state) {
+	case Follower:
 		rf.votedFor = -1
-	} else if state == Leader {
+		atomic.CompareAndSwapInt32(&rf.heartbeat, 0, 1)
+	case Candidate:
+		atomic.CompareAndSwapInt32(&rf.heartbeat, 1, 0)
+	case Leader:
 		for peer, _ := range rf.peers {
 			rf.nextIndex[peer] = len(rf.log)
-			rf.matchIndex[peer] = 0
+			if peer == rf.me {
+				rf.matchIndex[peer] = len(rf.log) - 1
+			} else {
+				rf.matchIndex[peer] = 0
+			}
 		}
 	}
 }
