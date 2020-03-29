@@ -555,6 +555,10 @@ loop:
 // Returns false if the leader loses its authority
 func (rf *Raft) doSyncLogWithFollower(server int, count int) bool {
 	rf.mu.Lock()
+	if rf.isKilled || rf.state != Leader {
+		rf.mu.Unlock()
+		return rf.state == Leader
+	}
 	term := rf.currentTerm
 	lastLogIndex := len(rf.log) - 1
 	nextIndex := rf.nextIndex[server]
