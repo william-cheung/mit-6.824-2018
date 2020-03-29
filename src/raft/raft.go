@@ -63,9 +63,9 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 
-	currentTerm int      // Latest term this peer has seen
-	votedFor    int      // CandidateId that received vote in current term
-	state       int      // This peer's current state or role
+	currentTerm int // Latest term this peer has seen
+	votedFor    int // CandidateId that received vote in current term
+	state       int // This peer's current state or role
 
 	heartbeatCh chan int // Channel for heartbeat notification
 	heartbeat   int32    // Indicates a heartbeat is received but not checked
@@ -116,10 +116,10 @@ func (rf *Raft) transitionTo(term int, state int) {
 	rf.currentTerm = term
 	rf.state = state
 
-	switch (state) {
+	switch state {
 	case Follower:
 		rf.votedFor = -1
-		rf.onHeartbeatReceived(-1) // reset timer
+		rf.onHeartbeatReceived(-1) // reset election timeout
 	case Leader:
 		for peer, _ := range rf.peers {
 			rf.nextIndex[peer] = len(rf.log)
@@ -463,6 +463,7 @@ func (rf *Raft) runAsFollower() {
 	rf.mu.Unlock()
 }
 
+// Returns true if vote is granted
 func (rf *Raft) requestVote(
 	server int, term, lastLogIndex, lastLogTerm int) bool {
 
@@ -570,7 +571,7 @@ loop:
 }
 
 // Returns false if the leader loses its authority
-func (rf *Raft) doSyncLogWithFollower(server int, count int) bool {
+func (rf *Raft) appendEntries(server int, count int) bool {
 	rf.mu.Lock()
 	if rf.isKilled || rf.state != Leader {
 		rf.mu.Unlock()
@@ -634,7 +635,6 @@ func (rf *Raft) doSyncLogWithFollower(server int, count int) bool {
 			}
 		}
 		rf.nextIndex[server] = reply.XIndex
-		DPrintf("nextIndex of %d: %v", rf.me, rf.nextIndex)
 	}
 	return true
 }
@@ -655,7 +655,7 @@ func (rf *Raft) syncLogWithFollower(server int) {
 		}
 		rf.mu.Unlock()
 
-		if !rf.doSyncLogWithFollower(server, 10) {
+		if !rf.appendEntries(server, 10) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -712,7 +712,7 @@ func (rf *Raft) sendHeartbeat(server int) bool {
 	if server == rf.me {
 		return true
 	}
-	return rf.doSyncLogWithFollower(server, 0)
+	return rf.appendEntries(server, 0)
 }
 
 func (rf *Raft) runAsLeader() {
@@ -742,8 +742,9 @@ func (rf *Raft) runAsLeader() {
 	loop:
 		for {
 			select {
-			case isLeader := <-ch:
-				if !isLeader {
+			case ok := <-ch:
+				// if the leader loses its authority
+				if !ok {
 					return
 				}
 				count += 1
@@ -798,12 +799,15 @@ func (rf *Raft) run() {
 
 	for {
 		rf.mu.Lock()
-		term, state, isKilled := rf.currentTerm, rf.state, rf.isKilled
+		state, isKilled := rf.state, rf.isKilled
 		rf.mu.Unlock()
+
 		if isKilled {
 			break
 		}
-		DPrintf("loop: state of %d: <%d, %d>", rf.me, term, state)
+
+		DPrintf("loop: state of %d: %d", rf.me, state)
+
 		switch state {
 		case Follower:
 			rf.runAsFollower()
