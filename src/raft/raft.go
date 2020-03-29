@@ -62,9 +62,9 @@ type Raft struct {
 	persister *Persister          // Object to hold this peer's persisted state
 	me        int                 // this peer's index into peers[]
 
-	currentTerm int // Latest term this peer has seen
-	votedFor    int // CandidateId that received vote in current term
-	state       int // This peer's current state or role
+	currentTerm int      // Latest term this peer has seen
+	votedFor    int      // CandidateId that received vote in current term
+	state       int      // This peer's current state or role
 	heartbeatCh chan int // Channel for heartbeat notification
 
 	log []LogEntry // Log entries. Start from index 1
@@ -120,11 +120,10 @@ func (rf *Raft) transitionTo(term int, state int) {
 	}
 }
 
-
 func (rf *Raft) onHeartbeatReceived(leaderId int) {
 	DPrintf("heartbeat received: %d --> %d", leaderId, rf.me)
 	select {
-	case rf.heartbeatCh<-1:
+	case rf.heartbeatCh <- 1:
 	default:
 	}
 }
@@ -443,15 +442,14 @@ func (rf *Raft) runAsFollower() {
 	rf.mu.Unlock()
 }
 
-
 func (rf *Raft) requestVote(
 	server int, term, lastLogIndex, lastLogTerm int) bool {
 
 	args := RequestVoteArgs{
-		Term: term,
-		CandidateId: rf.me,
+		Term:         term,
+		CandidateId:  rf.me,
 		LastLogIndex: lastLogIndex,
-		LastLogTerm: lastLogTerm,
+		LastLogTerm:  lastLogTerm,
 	}
 
 	var reply RequestVoteReply
@@ -579,7 +577,7 @@ func (rf *Raft) doSyncLogWithFollower(server int, count int) bool {
 	defer rf.mu.Unlock()
 
 	if reply.Success {
-		rf.nextIndex[server] += nEntries
+		rf.nextIndex[server] = prevLogIndex + 1 + nEntries
 		rf.matchIndex[server] = prevLogIndex + nEntries
 	} else {
 		if reply.Term > rf.currentTerm {
@@ -602,6 +600,7 @@ func (rf *Raft) doSyncLogWithFollower(server int, count int) bool {
 			}
 		}
 		rf.nextIndex[server] = reply.XIndex
+		DPrintf("nextIndex of %d: %v", rf.me, rf.nextIndex)
 	}
 	return true
 }
@@ -672,7 +671,6 @@ func (rf *Raft) updateCommitIndex() {
 	}
 }
 
-
 func (rf *Raft) sendHeartbeat(server int) bool {
 	if server == rf.me {
 		return true
@@ -707,7 +705,7 @@ func (rf *Raft) runAsLeader() {
 	loop:
 		for {
 			select {
-			case  isLeader := <-ch:
+			case isLeader := <-ch:
 				if !isLeader {
 					return
 				}
@@ -737,7 +735,7 @@ func (rf *Raft) applyLog() {
 			continue
 		}
 
-		msgs := make([]ApplyMsg, rf.commitIndex - rf.lastApplied)
+		msgs := make([]ApplyMsg, rf.commitIndex-rf.lastApplied)
 		for i := rf.lastApplied + 1; i <= rf.commitIndex; i++ {
 			j := i - rf.lastApplied - 1
 			msgs[j] = ApplyMsg{
