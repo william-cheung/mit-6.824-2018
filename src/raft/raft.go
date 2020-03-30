@@ -242,8 +242,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}()
 
 	if args.Term > rf.currentTerm || rf.state == Candidate {
+		persist = args.Term > rf.currentTerm
 		rf.transitionTo(args.Term, Follower)
-		persist = true
 	}
 
 	if args.PrevLogIndex >= len(rf.log) {
@@ -522,6 +522,10 @@ func (rf *Raft) requestVote(
 			return true
 		}
 		rf.mu.Lock()
+		if term != rf.currentTerm {
+			rf.mu.Unlock()
+			return false
+		}
 		if reply.Term > rf.currentTerm {
 			rf.transitionTo(reply.Term, Follower)
 			rf.persist()
@@ -600,10 +604,10 @@ loop:
 	if rf.state == Candidate {
 		if state == Candidate {
 			rf.transitionTo(rf.currentTerm+1, state)
+			rf.persist()
 		} else {
 			rf.transitionTo(rf.currentTerm, state)
 		}
-		rf.persist()
 	}
 	rf.mu.Unlock()
 }
@@ -647,6 +651,10 @@ func (rf *Raft) appendEntries(server int, count int) bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
+	if term != rf.currentTerm {
+		return false
+	}
+
 	if reply.Success {
 		nextIndex := prevLogIndex + 1 + nEntries
 		if nextIndex > rf.nextIndex[server] {
@@ -659,6 +667,8 @@ func (rf *Raft) appendEntries(server int, count int) bool {
 			rf.persist()
 			return false
 		}
+
+		rf.logSubmitted.Broadcast()
 
 		if reply.XLen < prevLogIndex {
 			rf.nextIndex[server] = reply.XLen + 1
