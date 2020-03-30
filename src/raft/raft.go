@@ -23,8 +23,8 @@ import "time"
 import "math/rand"
 import "sync/atomic"
 
-// import "bytes"
-// import "labgob"
+import "bytes"
+import "labgob"
 
 const (
 	Follower  = 0
@@ -149,14 +149,18 @@ func (rf *Raft) onHeartbeatReceived(leaderId int) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+
+	DPrintf("persist state of %d: currentTerm %d, votedFor %d, log %v",
+		rf.me, rf.currentTerm, rf.votedFor, rf.log)
+
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -166,19 +170,25 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var term int
+	var votedFor int
+	var log []LogEntry
+
+	if d.Decode(&term) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		panic("Failed to read persisted state")
+	} else {
+		rf.currentTerm = term
+		rf.votedFor = votedFor
+		rf.log = log
+	}
+
+	DPrintf("read persist state of %d: currentTerm %d, votedFor %d, log %v",
+		rf.me, rf.currentTerm, rf.votedFor, rf.log)
 }
 
 //
@@ -223,8 +233,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	rf.onHeartbeatReceived(args.LeaderId)
 
+	persist := false
+
+	defer func() {
+		if persist {
+			rf.persist()
+		}
+	}()
+
 	if args.Term > rf.currentTerm || rf.state == Candidate {
 		rf.transitionTo(args.Term, Follower)
+		persist = true
 	}
 
 	if args.PrevLogIndex >= len(rf.log) {
@@ -249,9 +268,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		j := args.PrevLogIndex + i + 1
 		if j < len(rf.log) && entry.Term != rf.log[j].Term {
 			rf.log = rf.log[:j]
+			persist = true
 		}
 		if j >= len(rf.log) {
 			rf.log = append(rf.log, entry)
+			persist = true
 		}
 	}
 
@@ -310,9 +331,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
+	persist := false
+
 	if args.Term > rf.currentTerm {
 		rf.votedFor = args.CandidateId
 		rf.transitionTo(args.Term, Follower)
+		persist = true
 	}
 
 	// assert args.Term == rf.currentTerm
@@ -327,9 +351,14 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		}
 		if voteGranted {
 			rf.votedFor = args.CandidateId
+			persist = true
 		}
 	}
 	reply.Term, reply.VoteGranted = rf.currentTerm, voteGranted
+
+	if persist {
+		rf.persist()
+	}
 }
 
 //
@@ -395,6 +424,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.nextIndex[rf.me] = len(rf.log)
 		rf.matchIndex[rf.me] = len(rf.log) - 1
 		rf.logSubmitted.Broadcast()
+		rf.persist()
 	}
 	rf.mu.Unlock()
 
@@ -460,6 +490,7 @@ func (rf *Raft) runAsFollower() {
 
 	rf.mu.Lock()
 	rf.transitionTo(rf.currentTerm+1, Candidate)
+	rf.persist()
 	rf.mu.Unlock()
 }
 
@@ -488,6 +519,7 @@ func (rf *Raft) requestVote(
 		rf.mu.Lock()
 		if reply.Term > rf.currentTerm {
 			rf.transitionTo(reply.Term, Follower)
+			rf.persist()
 		}
 		rf.mu.Unlock()
 	}
@@ -566,6 +598,7 @@ loop:
 		} else {
 			rf.transitionTo(rf.currentTerm, state)
 		}
+		rf.persist()
 	}
 	rf.mu.Unlock()
 }
@@ -581,6 +614,7 @@ func (rf *Raft) appendEntries(server int, count int) bool {
 	lastLogIndex := len(rf.log) - 1
 	nextIndex := rf.nextIndex[server]
 	prevLogIndex := nextIndex - 1
+
 	prevLogTerm := rf.log[prevLogIndex].Term
 	nEntries := lastLogIndex - prevLogIndex // always >= 0
 	if nEntries > count {
@@ -617,6 +651,7 @@ func (rf *Raft) appendEntries(server int, count int) bool {
 	} else {
 		if reply.Term > rf.currentTerm {
 			rf.transitionTo(reply.Term, Follower)
+			rf.persist()
 			return false
 		}
 
@@ -743,7 +778,8 @@ func (rf *Raft) runAsLeader() {
 		for {
 			select {
 			case ok := <-ch:
-				// if the leader loses its authority
+				// if the leader loses its authority,
+				// it should step down immediately.
 				if !ok {
 					return
 				}
