@@ -288,10 +288,12 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if newCommit > args.LeaderCommit {
 			newCommit = args.LeaderCommit
 		}
-		DPrintf("commitIndex of %d changed: %d -> %d",
-			rf.me, rf.commitIndex, newCommit)
-		rf.commitIndex = newCommit
-		rf.logCommitted.Broadcast()
+		if newCommit > rf.commitIndex {
+			DPrintf("commitIndex of %d changed: %d -> %d",
+				rf.me, rf.commitIndex, newCommit)
+			rf.commitIndex = newCommit
+			rf.logCommitted.Broadcast()
+		}
 	}
 
 	reply.Term, reply.Success = rf.currentTerm, true
