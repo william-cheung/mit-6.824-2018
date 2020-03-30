@@ -253,11 +253,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.XLen = len(rf.log) - 1
 		reply.XTerm = rf.log[args.PrevLogIndex].Term
+		reply.XIndex = args.PrevLogIndex
+		reply.XLen = len(rf.log) - 1
 		for index := args.PrevLogIndex - 1; index > 0; index-- {
 			if rf.log[index].Term == reply.XTerm {
 				reply.XIndex = index
+			} else {
+				break
 			}
 		}
 		reply.Term, reply.Success = rf.currentTerm, false
