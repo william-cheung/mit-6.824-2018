@@ -120,6 +120,8 @@ func (rf *Raft) transitionTo(term int, state int) {
 	case Follower:
 		rf.votedFor = -1
 		rf.onHeartbeatReceived(-1) // reset election timeout
+	case Candidate:
+		rf.votedFor = rf.me
 	case Leader:
 		for peer, _ := range rf.peers {
 			rf.nextIndex[peer] = len(rf.log)
@@ -339,8 +341,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	persist := false
 
 	if args.Term > rf.currentTerm {
-		rf.votedFor = args.CandidateId
 		rf.transitionTo(args.Term, Follower)
+		rf.votedFor = args.CandidateId
 		persist = true
 	}
 
@@ -513,7 +515,6 @@ func (rf *Raft) requestVote(
 	var reply RequestVoteReply
 
 	if server == rf.me {
-		rf.RequestVote(&args, &reply)
 		return true
 	}
 
@@ -522,10 +523,6 @@ func (rf *Raft) requestVote(
 			return true
 		}
 		rf.mu.Lock()
-		if term != rf.currentTerm {
-			rf.mu.Unlock()
-			return false
-		}
 		if reply.Term > rf.currentTerm {
 			rf.transitionTo(reply.Term, Follower)
 			rf.persist()
