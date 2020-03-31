@@ -718,41 +718,41 @@ func (rf *Raft) syncLogWithFollowers() {
 }
 
 func (rf *Raft) updateCommitIndex() {
-	for {
-		rf.mu.Lock()
-		if rf.isKilled || rf.state != Leader {
-			rf.mu.Unlock()
-			return
-		}
-		DPrintf("matchIndex of %d: %v", rf.me, rf.matchIndex)
-		commitIndex := rf.commitIndex
-		for peer, _ := range rf.peers {
-			n := rf.matchIndex[peer]
-			count := 0
-			if n <= commitIndex {
-				continue
-			}
-			for peer, _ := range rf.peers {
-				if n <= rf.matchIndex[peer] {
-					count += 1
-				}
-			}
-			if count > len(rf.peers)/2 {
-				commitIndex = n
-			}
-		}
-		committed := commitIndex - rf.commitIndex
-		if committed == 0 {
-			rf.mu.Unlock()
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		DPrintf("commitIndex of %d changed: %d -> %d",
-			rf.me, rf.commitIndex, commitIndex)
-		rf.commitIndex = commitIndex
-		rf.logCommitted.Broadcast()
-		rf.mu.Unlock()
-	}
+        for {
+                rf.mu.Lock()
+                if rf.isKilled || rf.state != Leader {
+                        rf.mu.Unlock()
+                        return
+                }
+                DPrintf("matchIndex of %d: %v", rf.me, rf.matchIndex)
+                N := rf.commitIndex
+                for peer, _ := range rf.peers {
+                        n := rf.matchIndex[peer]
+                        if n <= rf.commitIndex {
+                                continue
+                        }
+                        count := 0
+                        for peer, _ := range rf.peers {
+                                if n <= rf.matchIndex[peer] {
+                                        count += 1
+                                }
+                        }
+                        if count > len(rf.peers)/2 {
+                                N = n
+                        }
+                }
+                committed := N - rf.commitIndex
+                if committed == 0 || rf.log[N].Term != rf.currentTerm {
+                        rf.mu.Unlock()
+                        time.Sleep(10 * time.Millisecond)
+                        continue
+                }
+                DPrintf("commitIndex of %d changed: %d -> %d",
+                        rf.me, rf.commitIndex, N)
+                rf.commitIndex = N
+                rf.logCommitted.Broadcast()
+                rf.mu.Unlock()
+        }
 }
 
 func (rf *Raft) sendHeartbeat(server int) bool {
