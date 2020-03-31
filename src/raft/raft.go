@@ -623,7 +623,7 @@ func (rf *Raft) appendEntries(server int, count int) bool {
 
 	prevLogTerm := rf.log[prevLogIndex].Term
 	nEntries := lastLogIndex - prevLogIndex // always >= 0
-	if nEntries > count {
+	if count >= 0 && nEntries > count {
 		nEntries = count
 	}
 	entries := rf.log[nextIndex : nextIndex+nEntries]
@@ -702,7 +702,7 @@ func (rf *Raft) syncLogWithFollower(server int) {
 		}
 		rf.mu.Unlock()
 
-		if !rf.appendEntries(server, 10) {
+		if !rf.appendEntries(server, 100) {
 			return
 		}
 		time.Sleep(10 * time.Millisecond)
