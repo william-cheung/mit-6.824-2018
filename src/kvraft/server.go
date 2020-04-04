@@ -32,6 +32,12 @@ type Result struct {
 	Value string
 }
 
+// State machine state that needs to be persisted in a snapshot
+type State struct {
+	ResultMap map[int64]Result
+	M         map[string]string
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -42,14 +48,16 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	resultMap map[int64]Result
-	m         map[string]string
+	state State // state machine state
+
+	// index of the raft log entry last applied to the state machine
+	lastApplied int
 }
 
 func (kv *KVServer) dup(ckID int64, seq int64) (Result, bool) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
-	result, ok := kv.resultMap[ckID]
+	result, ok := kv.state.ResultMap[ckID]
 	if !ok || seq > result.Seq {
 		return result, false
 	}
@@ -67,7 +75,7 @@ func (kv *KVServer) exec(op Op) (Result, bool) {
 			return Result{}, false
 		}
 		kv.mu.Lock()
-		result, ok := kv.resultMap[op.CkID]
+		result, ok := kv.state.ResultMap[op.CkID]
 		if !ok || result.Seq < op.Seq {
 			kv.mu.Unlock()
 			time.Sleep(10 * time.Millisecond)
@@ -133,29 +141,59 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 func (kv *KVServer) apply() {
 	for msg := range kv.applyCh {
-		DPrintf("KVS %d: Apply %+v", kv.me, msg)
-		//index := msg.CommandIndex
-		op := msg.Command.(Op)
-
 		kv.mu.Lock()
+
 		if kv.isKilled {
+			kv.mu.Unlock()
 			return
 		}
 
-		result, ok := kv.resultMap[op.CkID]
-		if !ok || result.Seq < op.Seq {
-			result = kv.doApply(op)
-			kv.resultMap[op.CkID] = result
+		if !msg.CommandValid {
+			DPrintf("KVS %d: Apply Snapshot", kv.me)
+			snapshot := msg.Command.(raft.Snapshot)
+			kv.applySnapshot(snapshot)
+		} else {
+			DPrintf("KVS %d: Apply Command %+v",
+				kv.me, msg)
+			index := msg.CommandIndex
+			op := msg.Command.(Op)
+			kv.applyCommand(index, op)
 		}
+
 		kv.mu.Unlock()
 	}
 }
 
-func (kv *KVServer) doApply(op Op) Result {
+func (kv *KVServer) applySnapshot(snapshot raft.Snapshot) {
+	state := snapshot.State
+	if state == nil {
+		kv.state = State{
+			ResultMap: make(map[int64]Result),
+			M:         make(map[string]string),
+		}
+	} else {
+		kv.state = state.(State)
+	}
+	kv.lastApplied = snapshot.LastIndex
+}
+
+func (kv *KVServer) applyCommand(index int, op Op) {
+	if index <= kv.lastApplied {
+		return
+	}
+	result, ok := kv.state.ResultMap[op.CkID]
+	if !ok || result.Seq < op.Seq {
+		result = kv.doApplyCommand(op)
+		kv.state.ResultMap[op.CkID] = result
+	}
+	kv.lastApplied = index
+}
+
+func (kv *KVServer) doApplyCommand(op Op) Result {
 	var result Result
 	switch op.Op {
 	case "Get":
-		value, ok := kv.m[op.Key]
+		value, ok := kv.state.M[op.Key]
 		if !ok {
 			result.Err = ErrNoKey
 		} else {
@@ -163,19 +201,52 @@ func (kv *KVServer) doApply(op Op) Result {
 			result.Value = value
 		}
 	case "Put":
-		kv.m[op.Key] = op.Value
+		kv.state.M[op.Key] = op.Value
 		result.Err = OK
 	case "Append":
-		value, ok := kv.m[op.Key]
+		value, ok := kv.state.M[op.Key]
 		if !ok {
-			kv.m[op.Key] = op.Value
+			kv.state.M[op.Key] = op.Value
 		} else {
-			kv.m[op.Key] = value + op.Value
+			kv.state.M[op.Key] = value + op.Value
 		}
 		result.Err = OK
 	}
 	result.Seq = op.Seq
 	return result
+}
+
+func (kv *KVServer) snapshot() {
+	for {
+		if kv.rf.StateSize() >= kv.maxraftstate {
+			kv.mu.Lock()
+			if kv.isKilled {
+				kv.mu.Unlock()
+				return
+			}
+			snapshot := kv.takeSnapshot()
+			kv.mu.Unlock()
+			kv.rf.CompactLog(snapshot)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func (kv *KVServer) takeSnapshot() raft.Snapshot {
+	state := State{
+		ResultMap: make(map[int64]Result),
+		M:         make(map[string]string),
+	}
+	for ckID, result := range kv.state.ResultMap {
+		state.ResultMap[ckID] = result
+	}
+	for key, value := range kv.state.M {
+		state.M[key] = value
+	}
+	return raft.Snapshot{
+		State:     state,
+		LastIndex: kv.lastApplied,
+	}
 }
 
 //
@@ -219,10 +290,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	kv.resultMap = make(map[int64]Result)
-	kv.m = make(map[string]string)
-
 	go kv.apply()
+	//go kv.snapshot()
 
 	return kv
 }
