@@ -911,7 +911,9 @@ func (rf *Raft) appendEntries(server int, count int) bool {
 
 	if reply.Success {
 		nextIndex := prevLogIndex + 1 + nEntries
-		rf.nextIndex[server] = nextIndex
+		if nextIndex > rf.nextIndex[server] {
+			rf.nextIndex[server] = nextIndex
+		}
 		if nextIndex-1 > rf.matchIndex[server] {
 			rf.matchIndex[server] = nextIndex - 1
 		}
@@ -986,7 +988,9 @@ func (rf *Raft) installSnapshot(server int) bool {
 	}
 
 	nextIndex := snapshot.LastIncludedIndex + 1
-	rf.nextIndex[server] = nextIndex
+	if nextIndex > rf.nextIndex[server] {
+		rf.nextIndex[server] = nextIndex
+	}
 	if nextIndex-1 > rf.matchIndex[server] {
 		rf.matchIndex[server] = nextIndex - 1
 	}
