@@ -38,6 +38,13 @@ type State struct {
 	M         map[string]string
 }
 
+func emptyState() State {
+	return State{
+		ResultMap: make(map[int64]Result),
+		M:         make(map[string]string),
+	}
+}
+
 type KVServer struct {
 	mu      sync.Mutex
 	me      int
@@ -167,14 +174,11 @@ func (kv *KVServer) apply() {
 func (kv *KVServer) applySnapshot(snapshot raft.Snapshot) {
 	state := snapshot.State
 	if state == nil {
-		kv.state = State{
-			ResultMap: make(map[int64]Result),
-			M:         make(map[string]string),
-		}
+		kv.state = emptyState()
 	} else {
 		kv.state = state.(State)
 	}
-	kv.lastApplied = snapshot.LastIndex
+	kv.lastApplied = snapshot.LastIncludedIndex
 }
 
 func (kv *KVServer) applyCommand(index int, op Op) {
@@ -233,10 +237,7 @@ func (kv *KVServer) snapshot() {
 }
 
 func (kv *KVServer) takeSnapshot() raft.Snapshot {
-	state := State{
-		ResultMap: make(map[int64]Result),
-		M:         make(map[string]string),
-	}
+	state := emptyState()
 	for ckID, result := range kv.state.ResultMap {
 		state.ResultMap[ckID] = result
 	}
@@ -244,8 +245,8 @@ func (kv *KVServer) takeSnapshot() raft.Snapshot {
 		state.M[key] = value
 	}
 	return raft.Snapshot{
-		State:     state,
-		LastIndex: kv.lastApplied,
+		State:             state,
+		LastIncludedIndex: kv.lastApplied,
 	}
 }
 
@@ -289,6 +290,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
+
+	kv.state = emptyState()
 
 	go kv.apply()
 	//go kv.snapshot()

@@ -39,9 +39,11 @@ const (
 )
 
 type Snapshot struct {
-	State     interface{} // State machine state
-	LastIndex int         // Index of the log entry included in the snapshot
-	LastTerm  int         // Term of that log entry
+	State interface{} // State machine state
+
+	// Index of the last log entry included in the snapshot
+	LastIncludedIndex int
+	LastIncludedTerm  int // Term of LastIndcludedIndex
 }
 
 //
@@ -99,12 +101,8 @@ type Raft struct {
 	replicateCond *sync.Cond // To notify log needs to be replicated
 	logCommitted  *sync.Cond // To notify a new log entry has been committed
 
-	lastIndex int // Last included index in snapshot of state machine
-	lastTerm  int // Last included term in snapshot of state machine
-
-	receivedLastIndex int
-	receivedLastTerm  int
-	receivedSnapshot  []byte // Snapshot received from leader
+	lastSnapshot Snapshot // Infomation of last snapshot
+	tempSnapshot Snapshot // For receiving snapshot from leader
 
 	isKilled bool // Whether this peer has been killed
 }
@@ -203,25 +201,38 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.me, rf.currentTerm, rf.votedFor, rf.log)
 }
 
+// raft state size in bytes
 func (rf *Raft) StateSize() int {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	return rf.persister.RaftStateSize()
 }
 
+// log compaction
 func (rf *Raft) CompactLog(snapshot Snapshot) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if snapshot.LastIndex < rf.lastIndex {
+
+	if snapshot.LastIncludedIndex <= rf.lastSnapshot.LastIncludedIndex {
 		return
 	}
 
-	lastIndex := len(rf.log) + rf.lastIndex - 1
-	rf.lastTerm = rf.log[snapshot.LastIndex-rf.lastIndex].Term
-	rf.lastIndex = snapshot.LastIndex
-	rf.log = rf.log[lastIndex-rf.lastIndex:]
+	if snapshot.LastIncludedIndex > rf.lastApplied {
+		DPrintf("Bug: snapshot includes log indices that have not" +
+			"been applied")
+		return
+	}
 
-	snapshot.LastTerm = rf.lastTerm
+	lastIndex := rf.lastSnapshot.LastIncludedIndex + len(rf.log) - 1
+	if snapshot.LastIncludedIndex > lastIndex {
+		DPrintf("Bug: last included index of snapshot > last index"+
+			"of the log of %d", rf.me)
+		return
+	}
+
+	rf.log = rf.log[lastIndex-snapshot.LastIncludedIndex:]
+	snapshot.LastIncludedTerm = rf.log[0].Term
+	rf.lastSnapshot = snapshot
 
 	rf.persister.SaveStateAndSnapshot(
 		rf.encodeState(),
@@ -238,12 +249,11 @@ func (rf *Raft) readSnapshot(data []byte) Snapshot {
 		panic("Failed to read snapshot")
 	}
 	rf.mu.Lock()
-	if rf.lastIndex < snapshot.LastIndex {
-		rf.lastIndex = snapshot.LastIndex
-		rf.lastTerm = snapshot.LastTerm
+	if rf.lastSnapshot.LastIncludedIndex < snapshot.LastIncludedIndex {
+		rf.lastSnapshot = snapshot
 	}
-	if rf.lastApplied < snapshot.LastIndex {
-		rf.lastApplied = snapshot.LastIndex
+	if rf.lastApplied < snapshot.LastIncludedIndex {
+		rf.lastApplied = snapshot.LastIncludedIndex
 	}
 	rf.mu.Unlock()
 	return snapshot
@@ -272,7 +282,6 @@ func decode(data []byte, object interface{}) error {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	return d.Decode(object)
-
 }
 
 //
@@ -535,55 +544,63 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 
 	reply.Term = rf.currentTerm
 
-	if args.LastIncludedIndex <= rf.lastIndex {
+	if args.LastIncludedIndex <= rf.lastSnapshot.LastIncludedIndex {
 		return
 	}
 
-	if args.LastIncludedIndex != rf.receivedLastIndex {
+	if args.LastIncludedIndex != rf.tempSnapshot.LastIncludedIndex {
 		if args.Offset == 0 {
-			rf.receivedLastIndex = args.LastIncludedIndex
-			rf.receivedLastTerm = args.LastIncludedTerm
-			rf.receivedSnapshot = args.Data
+			rf.tempSnapshot = Snapshot{
+				LastIncludedIndex: args.LastIncludedIndex,
+				LastIncludedTerm:  args.LastIncludedTerm,
+				State:             args.Data,
+			}
 		} else {
 			return
 		}
 	}
 
-	if args.LastIncludedIndex == rf.receivedLastIndex {
-		if args.Offset != len(rf.receivedSnapshot) {
-			return
-		}
-		rf.receivedSnapshot = append(
-			rf.receivedSnapshot, args.Data...)
+	rawSnapshot := rf.tempSnapshot.State.([]byte)
+	if args.Offset != len(rawSnapshot) {
+		return
 	}
+	rawSnapshot = append(rawSnapshot, args.Data...)
+	rf.tempSnapshot.State = rawSnapshot
 
 	if !args.Done {
 		return
 	}
 
-	lastIndex := rf.lastIndex + len(rf.log) - 1
+	var snapshot Snapshot
+	if decode(rawSnapshot, &snapshot) != nil {
+		return
+	}
+	if snapshot.LastIncludedIndex != args.LastIncludedIndex ||
+		snapshot.LastIncludedTerm != args.LastIncludedTerm {
+		return
+	}
+
+	lastIndex := rf.lastSnapshot.LastIncludedIndex + len(rf.log) - 1
 	if lastIndex >= args.LastIncludedIndex {
-		offset := lastIndex - args.LastIncludedIndex
-		rf.log = rf.log[offset:]
+		rf.log = rf.log[lastIndex-args.LastIncludedIndex:]
 	} else {
 		rf.log = rf.log[:1]
 	}
-	rf.log[0] = LogEntry{
-		Term: args.LastIncludedTerm,
+	rf.log[0].Term = args.LastIncludedTerm
+	rf.lastSnapshot = snapshot
+	if rf.lastApplied < args.LastIncludedIndex {
+		rf.lastApplied = args.LastIncludedIndex
 	}
-	rf.lastIndex = args.LastIncludedIndex
-	rf.lastTerm = args.LastIncludedTerm
+
 	rf.persister.SaveStateAndSnapshot(
 		rf.encodeState(),
-		rf.receivedSnapshot,
+		rawSnapshot,
 	)
 
-	rawSnapshot := rf.receivedSnapshot
-	rf.receivedSnapshot = nil
 	go func() {
 		rf.applyCh <- ApplyMsg{
 			CommandValid: false,
-			Command:      rf.readSnapshot(rawSnapshot),
+			Command:      snapshot,
 		}
 	}()
 }
