@@ -230,6 +230,7 @@ func (kv *KVServer) snapshot() {
 			}
 			snapshot := kv.takeSnapshot()
 			kv.mu.Unlock()
+			labgob.Register(State{})
 			kv.rf.CompactLog(snapshot)
 		}
 		time.Sleep(10 * time.Millisecond)
@@ -294,7 +295,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.state = emptyState()
 
 	go kv.apply()
-	//go kv.snapshot()
+
+	if kv.maxraftstate > 0 {
+		go kv.snapshot()
+	}
 
 	return kv
 }
