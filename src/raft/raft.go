@@ -101,7 +101,7 @@ type Raft struct {
 	replicateCond *sync.Cond // To notify log needs to be replicated
 	logCommitted  *sync.Cond // To notify a new log entry has been committed
 
-	lastSnapshot Snapshot // Infomation of last snapshot
+	lastSnapshot Snapshot // Information of last snapshot
 
 	isKilled bool // Whether this peer has been killed
 }
@@ -114,6 +114,7 @@ func (rf *Raft) GetState() (int, bool) {
 	return rf.currentTerm, rf.state == Leader
 }
 
+// do state transition
 func (rf *Raft) transitionTo(term int, state int) {
 	if term < rf.currentTerm {
 		DPrintf("Warning: try to update currentTerm of %d from %d to %d",
@@ -223,7 +224,8 @@ func (rf *Raft) StateSize() int {
 	return rf.persister.RaftStateSize()
 }
 
-// log compaction
+// do log compaction. discard log entries that precede the given snapshot.
+// persist the raft state after compaction and the snapshot
 func (rf *Raft) CompactLog(snapshot Snapshot) {
 	rawSnapshot := encode(snapshot)
 
@@ -260,6 +262,7 @@ func (rf *Raft) CompactLog(snapshot Snapshot) {
 	DPrintf("log of %d after compaction: %+v", rf.me, rf.log)
 }
 
+// encode the Raft state to a byte array
 func (rf *Raft) encodeState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -269,6 +272,7 @@ func (rf *Raft) encodeState() []byte {
 	return w.Bytes()
 }
 
+// encode a Go object
 func encode(object interface{}) []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
@@ -276,6 +280,7 @@ func encode(object interface{}) []byte {
 	return w.Bytes()
 }
 
+// decode a Go object
 func decode(data []byte, object interface{}) error {
 	if data == nil || len(data) < 1 {
 		return nil
@@ -285,6 +290,7 @@ func decode(data []byte, object interface{}) error {
 	return d.Decode(object)
 }
 
+// retrieve the log entry with index
 func (rf *Raft) getLogEntry(index int) LogEntry {
 	i := index - rf.lastSnapshot.LastIncludedIndex
 	if i < 0 || i >= len(rf.log) {
@@ -294,6 +300,8 @@ func (rf *Raft) getLogEntry(index int) LogEntry {
 	return rf.log[i]
 }
 
+// retrieve log entries whose indices range from starIndex (included)
+// to endIndex (excluded)
 func (rf *Raft) getLogEntries(startIndex int, endIndex int) []LogEntry {
 	i := startIndex - rf.lastSnapshot.LastIncludedIndex
 	j := endIndex - rf.lastSnapshot.LastIncludedIndex
@@ -306,14 +314,17 @@ func (rf *Raft) getLogEntries(startIndex int, endIndex int) []LogEntry {
 
 }
 
+// get term of the log entry with index
 func (rf *Raft) getLogTerm(index int) int {
 	return rf.getLogEntry(index).Term
 }
 
+// index of the first log entry in the remaining log after last compaction
 func (rf *Raft) getFirstLogIndex() int {
 	return rf.lastSnapshot.LastIncludedIndex
 }
 
+// index of the last log entry in the remaining log after last compaction
 func (rf *Raft) getLastLogIndex() int {
 	return rf.lastSnapshot.LastIncludedIndex + len(rf.log) - 1
 }
@@ -387,6 +398,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
+	// ensure that args.PrevLogIndex >= rf.getFirstLogIndex()
 	if args.PrevLogIndex < rf.getFirstLogIndex() {
 		n := rf.getFirstLogIndex() - args.PrevLogIndex
 		if n >= len(args.Entries) {
@@ -453,10 +465,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Term, reply.Success = rf.currentTerm, true
 }
 
-func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+//
+// Send a AppendEntries RPC to a server
+//
+func (rf *Raft) sendAppendEntries(
+	server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	DPrintf("AppendEntries( %d --> %d ): args %+v", rf.me, server, args)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	DPrintf("AppendEntries( %d <-- %d ): %+v reply %+v", rf.me, server, ok, reply)
+	DPrintf("AppendEntries( %d <-- %d ): %+v reply %+v",
+		rf.me, server, ok, reply)
 	return ok
 }
 
@@ -553,13 +570,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
 //
-func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) sendRequestVote(
+	server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	DPrintf("RequestVote( %d --> %d ): args %+v", rf.me, server, args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
-	DPrintf("RequestVote( %d <-- %d ): %+v reply %+v", rf.me, server, ok, reply)
+	DPrintf("RequestVote( %d <-- %d ): %+v reply %+v",
+		rf.me, server, ok, reply)
 	return ok
 }
 
+//
+// InstallSnapshot RPC arguments structure
+//
 type InstallSnapshotArgs struct {
 	Term     int // leader's term
 	LeaderId int
@@ -573,11 +595,18 @@ type InstallSnapshotArgs struct {
 	Done   bool   // true if this is the last chunk
 }
 
+//
+// InstallSnapshot RPC reply structure
+//
 type InstallSnapshotReply struct {
 	Term int // currentTerm for leader to update itself
 }
 
-func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+//
+// InstallSnapshot RPC handler
+//
+func (rf *Raft) InstallSnapshot(
+	args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -589,6 +618,7 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	rf.onHeartbeatReceived(args.LeaderId)
 
 	if args.Term > rf.currentTerm {
+		// higher term discovered. become follower
 		rf.transitionTo(args.Term, Follower)
 		rf.persist()
 	}
@@ -604,37 +634,51 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 	if decode(rawSnapshot, &snapshot) != nil {
 		return
 	}
+	// ensure that the snapshot is valid
 	if snapshot.LastIncludedIndex != args.LastIncludedIndex ||
 		snapshot.LastIncludedTerm != args.LastIncludedTerm {
 		return
 	}
 
+	// discard log entries that precede the snapshot
 	lastIndex := rf.getLastLogIndex()
 	if lastIndex >= args.LastIncludedIndex {
 		rf.log = rf.getLogEntries(
 			args.LastIncludedIndex, lastIndex+1)
 	} else {
+		// discard the entrie log
 		rf.log = rf.log[:1]
 	}
 	rf.log[0].Term = args.LastIncludedTerm
-	rf.lastSnapshot = snapshot
+
+	// update lastApplied accordingly
 	if rf.lastApplied < args.LastIncludedIndex {
 		rf.lastApplied = args.LastIncludedIndex
 	}
 
+	// save the snapshot along with the raft state
+	rf.lastSnapshot = snapshot
 	rf.persister.SaveStateAndSnapshot(
 		rf.encodeState(),
 		rawSnapshot,
 	)
 
 	DPrintf("log of %d after install snapshot: %+v", rf.me, rf.log)
+
+	// reset state machine using snapshot contents
 	go rf.resetStateMachine(snapshot)
 }
 
-func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+//
+// Send a InstallSnapshot RPC to a server
+//
+func (rf *Raft) sendInstallSnapshot(
+	server int,
+	args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
 	DPrintf("InstallSnapshot( %d --> %d ): args %+v", rf.me, server, args)
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
-	DPrintf("InstallSnapshot( %d <-- %d ): %+v reply %+v", rf.me, server, ok, reply)
+	DPrintf("InstallSnapshot( %d <-- %d ): %+v reply %+v",
+		rf.me, server, ok, reply)
 	return ok
 }
 
@@ -867,6 +911,9 @@ func (rf *Raft) appendEntries(server int, count int) bool {
 		return rf.state == Leader
 	}
 
+	// do not send AppendEntries RPC if the leader believes that
+	// the follower is too far behind and it does not have enough
+	// information in log to bring the follower up-to-date
 	nextIndex := rf.nextIndex[server]
 	if nextIndex <= rf.getFirstLogIndex() {
 		rf.mu.Unlock()
@@ -911,9 +958,12 @@ func (rf *Raft) appendEntries(server int, count int) bool {
 
 	if reply.Success {
 		nextIndex := prevLogIndex + 1 + nEntries
+		// do nothing if the reply is obsolete
 		if nextIndex > rf.nextIndex[server] {
 			rf.nextIndex[server] = nextIndex
 		}
+		// ensure that rf.matchIndex[server] is monotonically
+		// increasing
 		if nextIndex-1 > rf.matchIndex[server] {
 			rf.matchIndex[server] = nextIndex - 1
 		}
@@ -1000,7 +1050,7 @@ func (rf *Raft) installSnapshot(server int) bool {
 // Replicates log entries to followers
 func (rf *Raft) replicateLog(server int) {
 	for {
-		installSnapshot := false
+		sendSnapshot := false
 		rf.mu.Lock()
 		for {
 			if rf.isKilled || rf.state != Leader {
@@ -1014,11 +1064,13 @@ func (rf *Raft) replicateLog(server int) {
 			}
 		}
 		if rf.nextIndex[server] <= rf.getFirstLogIndex() {
-			installSnapshot = true
+			// the follower is too far behind. send a snapshot
+			// to the follower
+			sendSnapshot = true
 		}
 		rf.mu.Unlock()
 
-		if installSnapshot {
+		if sendSnapshot {
 			if !rf.installSnapshot(server) {
 				return
 			}
@@ -1117,6 +1169,7 @@ func (rf *Raft) runAsLeader() {
 	}
 }
 
+// Reset state machine using snapshot contents
 func (rf *Raft) resetStateMachine(snapshot Snapshot) {
 	rf.applyCh <- ApplyMsg{
 		CommandValid: false,

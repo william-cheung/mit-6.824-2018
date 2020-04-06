@@ -26,6 +26,7 @@ type Op struct {
 	Value string
 }
 
+// Execution result of an op
 type Result struct {
 	Seq   int64
 	Err   Err
@@ -34,8 +35,8 @@ type Result struct {
 
 // State machine state that needs to be persisted in a snapshot
 type State struct {
-	ResultMap map[int64]Result
-	M         map[string]string
+	ResultMap map[int64]Result  // duplicate table
+	M         map[string]string // k/v mapping
 }
 
 func emptyState() State {
@@ -59,8 +60,15 @@ type KVServer struct {
 
 	// index of the raft log entry last applied to the state machine
 	lastApplied int
+
+	// condition variable
+	// to notify that a new command has been applied
+	applyCond *sync.Cond
 }
 
+//
+// Check if an op identified by ckID and seq has already been executed
+//
 func (kv *KVServer) dup(ckID int64, seq int64) (Result, bool) {
 	kv.mu.Lock()
 	defer kv.mu.Unlock()
@@ -71,6 +79,10 @@ func (kv *KVServer) dup(ckID int64, seq int64) (Result, bool) {
 	return result, true
 }
 
+//
+// Execute an op. The first return value is the execution result. The
+// second return value is true if the server believes it is the leader
+//
 func (kv *KVServer) exec(op Op) (Result, bool) {
 	_, term, isLeader := kv.rf.Start(op)
 	if !isLeader {
@@ -94,6 +106,9 @@ func (kv *KVServer) exec(op Op) (Result, bool) {
 
 }
 
+//
+// Get RPC handler
+//
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	DPrintf("KVS %d <-- Get %+v", kv.me, args)
 	defer func() { DPrintf("KVS %d --> Get %+v", kv.me, reply) }()
@@ -120,6 +135,9 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	}
 }
 
+//
+// PutAppend RPC handler
+//
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	DPrintf("KVS %d <-- PutAppend %+v", kv.me, args)
 	defer func() { DPrintf("KVS %d --> PutAppend %+v", kv.me, reply) }()
@@ -146,6 +164,9 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 
 }
 
+//
+// Continuously apply messages received from applyCh
+//
 func (kv *KVServer) apply() {
 	for msg := range kv.applyCh {
 		kv.mu.Lock()
@@ -186,11 +207,13 @@ func (kv *KVServer) applyCommand(index int, op Op) {
 		return
 	}
 	result, ok := kv.state.ResultMap[op.CkID]
+	// do not apply a command already seen
 	if !ok || result.Seq < op.Seq {
 		result = kv.doApplyCommand(op)
 		kv.state.ResultMap[op.CkID] = result
 	}
 	kv.lastApplied = index
+	kv.applyCond.Broadcast()
 }
 
 func (kv *KVServer) doApplyCommand(op Op) Result {
@@ -220,20 +243,37 @@ func (kv *KVServer) doApplyCommand(op Op) Result {
 	return result
 }
 
+//
+// Do log compaction if the Raft state size grows beyond the
+// specified threshold
+//
 func (kv *KVServer) snapshot() {
+	// register type State to GOB library. Or EOF
+	// error would occur when decoding a snapshot
+	labgob.Register(State{})
+
 	for {
-		if kv.rf.StateSize() >= kv.maxraftstate {
-			kv.mu.Lock()
+		kv.mu.Lock()
+		for {
 			if kv.isKilled {
 				kv.mu.Unlock()
 				return
 			}
-			snapshot := kv.takeSnapshot()
-			kv.mu.Unlock()
-			labgob.Register(State{})
-			kv.rf.CompactLog(snapshot)
+
+			size := kv.rf.StateSize()
+			if size < kv.maxraftstate {
+				kv.applyCond.Wait()
+			} else {
+				break
+			}
 		}
-		time.Sleep(10 * time.Millisecond)
+		snapshot := kv.takeSnapshot()
+		kv.mu.Unlock()
+
+		// tell Raft there is a snapshot. Raft will
+		// discard log entries that precede the
+		// snapshot
+		kv.rf.CompactLog(snapshot)
 	}
 }
 
@@ -248,6 +288,11 @@ func (kv *KVServer) takeSnapshot() raft.Snapshot {
 	return raft.Snapshot{
 		State:             state,
 		LastIncludedIndex: kv.lastApplied,
+		// k/v server do not track term of the
+		// last applied log entry, so we leave
+		// LastIncludedTerm unspecified here.
+		// Raft will fill out the field before
+		// saving the snapshot.
 	}
 }
 
@@ -293,6 +338,9 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.state = emptyState()
+
+	kv.lastApplied = 0
+	kv.applyCond = sync.NewCond(&kv.mu)
 
 	go kv.apply()
 
